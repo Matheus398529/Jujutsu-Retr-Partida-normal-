@@ -10,6 +10,10 @@ pcall(function()
     local old = parent:FindFirstChild("AdminV2Hub_JJR")
     if old then old:Destroy() end
 end)
+pcall(function()
+    local old = parent:FindFirstChild("AdminV2Hub_ESP")
+    if old then old:Destroy() end
+end)
 
 --// Tema
 local C = {
@@ -20,6 +24,8 @@ local C = {
     dark = Color3.fromRGB(95, 10, 20),
     off = Color3.fromRGB(60, 40, 44),
     text = Color3.fromRGB(240, 228, 228),
+    hp = Color3.fromRGB(60, 220, 90),
+    mana = Color3.fromRGB(50, 140, 255),
 }
 
 local function new(class, props, par)
@@ -33,6 +39,7 @@ local function stroke(o, col, t) return new("UIStroke", {Color = col or C.red, T
 
 --// GUI base
 local gui = new("ScreenGui", {Name = "AdminV2Hub_JJR", ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling}, parent)
+local espFolder = new("Folder", {Name = "AdminV2Hub_ESP"}, parent)
 
 --// Sons (pools reutilizáveis)
 local FUNC_SOUND_IDS = {
@@ -182,6 +189,399 @@ local bgImage = new("ImageLabel", {
 }, pInicio)
 corner(bgImage, 8)
 
+--// ABA: ESP NPC
+local pEsp = NewTab("ESP NPC")
+
+local espEnabled = false
+local espSide = "Em cima"     -- "Em cima", "Direita" ou "Esquerda" (alterar em Configurações)
+local ESP_OFFSET = 120        -- distância (pixels) da cabeça até a barra (Direita/Esquerda)
+local espData = {}            -- [Humanoid] = {gui, holder, conns, peak}
+local espConns = {}
+
+-- Busca de Energia Amaldiçoada / Energia máxima / Grau
+local function norm(s) return (tostring(s):lower():gsub("[%s_%-]", "")) end
+local function isEnergiaBase(n)
+    n = norm(n)
+    return (n:find("energ", 1, true) and n:find("amaldi", 1, true)) ~= nil
+        or n:find("cursedenergy", 1, true) ~= nil
+end
+local function hasMax(n)
+    return norm(n):find("max", 1, true) ~= nil
+end
+local function isEnergia(n) return isEnergiaBase(n) and not hasMax(n) end
+local function isEnergiaMax(n) return isEnergiaBase(n) and hasMax(n) end
+local function isGrau(n)
+    n = norm(n)
+    return n:find("grau", 1, true) ~= nil or n:find("grade", 1, true) ~= nil
+end
+local KINDS = {"energia", "energiamax", "grau"}
+local matchers = {energia = isEnergia, energiamax = isEnergiaMax, grau = isGrau}
+
+local function fromInst(inst, m)
+    if inst:IsA("ValueBase") and m(inst.Name) then
+        return function() return inst.Value end
+    end
+    for k in pairs(inst:GetAttributes()) do
+        if m(k) then return function() return inst:GetAttribute(k) end end
+    end
+    return nil
+end
+
+local function findInModel(model, kind)
+    local m = matchers[kind]
+    local g = fromInst(model, m)
+    if g then return g end
+    for _, d in ipairs(model:GetDescendants()) do
+        g = fromInst(d, m)
+        if g then return g end
+    end
+    return nil
+end
+
+-- Índice global (jogo inteiro), compartilhado entre os NPCs
+local gIndex = {energia = {}, energiamax = {}, grau = {}, t = 0, busy = false}
+
+local function indexInst(inst, out)
+    if inst:IsA("ValueBase") then
+        local n = inst.Name
+        for _, kind in ipairs(KINDS) do
+            if matchers[kind](n) then table.insert(out[kind], inst) end
+        end
+    end
+    local attrs = inst:GetAttributes()
+    if next(attrs) then
+        for k in pairs(attrs) do
+            for _, kind in ipairs(KINDS) do
+                if matchers[kind](k) then table.insert(out[kind], inst) end
+            end
+        end
+    end
+end
+
+local function refreshIndex()
+    if gIndex.busy or tick() - gIndex.t < 8 then return end
+    gIndex.busy = true
+    task.spawn(function()
+        local out = {energia = {}, energiamax = {}, grau = {}}
+        local ok = pcall(function()
+            local n = 0
+            for _, d in ipairs(game:GetDescendants()) do
+                indexInst(d, out)
+                n = n + 1
+                if n % 3000 == 0 then task.wait() end
+            end
+        end)
+        if ok then
+            gIndex.energia, gIndex.energiamax, gIndex.grau = out.energia, out.energiamax, out.grau
+        end
+        gIndex.t = tick()
+        gIndex.busy = false
+    end)
+end
+
+local function findGlobal(model, kind)
+    refreshIndex()
+    local m = matchers[kind]
+    for _, inst in ipairs(gIndex[kind]) do
+        local anc = inst.Parent
+        while anc and anc ~= game do
+            if anc == model or anc.Name == model.Name then
+                return fromInst(inst, m)
+            end
+            anc = anc.Parent
+        end
+    end
+    return nil
+end
+
+local statCache = setmetatable({}, {__mode = "k"})
+local function fmtVal(v)
+    if typeof(v) == "number" then
+        return tostring(math.floor(v * 100 + 0.5) / 100)
+    end
+    return tostring(v)
+end
+
+-- Retorna o valor cru (ou nil se não achou)
+local function readRaw(model, kind)
+    local c = statCache[model]
+    if not c then c = {}; statCache[model] = c end
+    local ent = c[kind]
+    if ent and ent.get then
+        local ok, v = pcall(ent.get)
+        if ok and v ~= nil then return v end
+        ent.get = nil
+    end
+    if not ent or tick() - ent.t > 3 then
+        ent = {t = tick()}
+        c[kind] = ent
+        ent.get = findInModel(model, kind) or findGlobal(model, kind)
+        if ent.get then
+            local ok, v = pcall(ent.get)
+            if ok and v ~= nil then return v end
+        end
+    end
+    return nil
+end
+
+-- Cor única para cada NPC
+local espColor = setmetatable({}, {__mode = "k"})
+local espColorCount = 0
+local function getEspColor(model)
+    if not espColor[model] then
+        espColorCount = espColorCount + 1
+        espColor[model] = Color3.fromHSV((espColorCount * 0.618034) % 1, 0.75, 1)
+    end
+    return espColor[model]
+end
+
+local espBtn = new("TextButton", {
+    Size = UDim2.new(1, -24, 0, 36),
+    Position = UDim2.new(0, 12, 0, 12),
+    BackgroundColor3 = C.bg,
+    BackgroundTransparency = 0.25,
+    Text = "ESP NPC  [OFF]",
+    TextColor3 = C.text,
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    AutoButtonColor = false,
+    ZIndex = 2,
+}, pEsp)
+corner(espBtn, 6)
+stroke(espBtn, C.red, 1.5)
+
+local function refreshEspBtn()
+    espBtn.Text = "ESP NPC  [" .. (espEnabled and "ON" or "OFF") .. "]"
+    TweenService:Create(espBtn, TweenInfo.new(0.15), {
+        BackgroundColor3 = espEnabled and C.dark or C.bg,
+        BackgroundTransparency = espEnabled and 0.1 or 0.25,
+    }):Play()
+end
+
+espBtn.MouseEnter:Connect(function()
+    if not espEnabled then
+        TweenService:Create(espBtn, TweenInfo.new(0.12), {BackgroundColor3 = C.panel, BackgroundTransparency = 0.1}):Play()
+    end
+end)
+espBtn.MouseLeave:Connect(function()
+    refreshEspBtn()
+end)
+
+local function isNPC(hum)
+    local model = hum.Parent
+    if not model or not model:IsA("Model") then return false end
+    if Players:GetPlayerFromCharacter(model) then return false end
+    return true
+end
+
+local function isDead(hum)
+    if hum.Health <= 0 then return true end
+    if not hum:IsDescendantOf(workspace) then return true end
+    local ok, st = pcall(function() return hum:GetState() end)
+    if ok and st == Enum.HumanoidStateType.Dead then return true end
+    return false
+end
+
+local function applySide(holder)
+    if espSide == "Direita" then
+        holder.AnchorPoint = Vector2.new(0, 0.5)
+        holder.Position = UDim2.new(0.5, ESP_OFFSET, 0.5, 0)
+    elseif espSide == "Esquerda" then
+        holder.AnchorPoint = Vector2.new(1, 0.5)
+        holder.Position = UDim2.new(0.5, -ESP_OFFSET, 0.5, 0)
+    else
+        -- em cima da cabeça (parte de baixo do conjunto fica logo acima da cabeça)
+        holder.AnchorPoint = Vector2.new(0.5, 1)
+        holder.Position = UDim2.new(0.5, 0, 0.5, 0)
+    end
+end
+
+local function removeEsp(hum)
+    local d = espData[hum]
+    if not d then return end
+    espData[hum] = nil
+    for _, c in ipairs(d.conns) do c:Disconnect() end
+    if d.gui then d.gui:Destroy() end
+end
+
+local function addEsp(hum)
+    if not espEnabled or espData[hum] then return end
+    if not hum.Parent or not isNPC(hum) or isDead(hum) then return end
+
+    local model = hum.Parent
+    -- HumanoidRootPart não balança com a animação (a cabeça balança)
+    local adornee = model:FindFirstChild("HumanoidRootPart")
+        or model.PrimaryPart
+        or model:FindFirstChild("Head")
+        or model:FindFirstChildWhichIsA("BasePart")
+    if not adornee then return end
+
+    local col = getEspColor(model)
+    local height = math.clamp(model:GetExtentsSize().Y / 2 + 0.5, 2.5, 15)
+
+    local bb = new("BillboardGui", {
+        Name = "NPCESP",
+        Adornee = adornee,
+        AlwaysOnTop = true,
+        Size = UDim2.fromOffset(600, 80),
+        -- offset no mundo (fixo): não muda de direção quando a câmera inclina
+        StudsOffsetWorldSpace = Vector3.new(0, height, 0),
+        MaxDistance = 2000,
+    }, espFolder)
+
+    -- Container transparente (sem frame de fundo)
+    local holder = new("Frame", {
+        Size = UDim2.fromOffset(140, 52),
+        BackgroundTransparency = 1,
+    }, bb)
+
+    -- Nome
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 12), Position = UDim2.new(0, 0, 0, 0),
+        BackgroundTransparency = 1, Text = model.Name, TextColor3 = col,
+        Font = Enum.Font.GothamBold, TextSize = 11,
+        TextStrokeTransparency = 0.4, TextStrokeColor3 = Color3.new(0, 0, 0),
+        TextXAlignment = Enum.TextXAlignment.Center,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, holder)
+
+    -- Barra de VIDA (verde, primeira)
+    local hpBg = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 11), Position = UDim2.new(0, 0, 0, 14),
+        BackgroundColor3 = C.off, BorderSizePixel = 0,
+    }, holder)
+    corner(hpBg, 4); stroke(hpBg, Color3.new(0, 0, 0), 1)
+    local hpFill = new("Frame", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = C.hp, BorderSizePixel = 0,
+    }, hpBg)
+    corner(hpFill, 4)
+    local hpLbl = new("TextLabel", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "",
+        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 9,
+        TextStrokeTransparency = 0.4, TextStrokeColor3 = Color3.new(0, 0, 0), ZIndex = 2,
+    }, hpBg)
+
+    -- Barra de ENERGIA (azul, embaixo da vida)
+    local enBg = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 11), Position = UDim2.new(0, 0, 0, 27),
+        BackgroundColor3 = C.off, BorderSizePixel = 0,
+    }, holder)
+    corner(enBg, 4); stroke(enBg, Color3.new(0, 0, 0), 1)
+    local enFill = new("Frame", {
+        Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = C.mana, BorderSizePixel = 0,
+    }, enBg)
+    corner(enFill, 4)
+    local enLbl = new("TextLabel", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "",
+        TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold, TextSize = 9,
+        TextStrokeTransparency = 0.4, TextStrokeColor3 = Color3.new(0, 0, 0), ZIndex = 2,
+    }, enBg)
+
+    -- GRAU (pequeno, embaixo, sem frame)
+    local grLbl = new("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 10), Position = UDim2.new(0, 0, 0, 40),
+        BackgroundTransparency = 1, Text = "", TextColor3 = Color3.fromRGB(215, 200, 200),
+        Font = Enum.Font.GothamMedium, TextSize = 9,
+        TextStrokeTransparency = 0.5, TextStrokeColor3 = Color3.new(0, 0, 0),
+        TextXAlignment = Enum.TextXAlignment.Center,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, holder)
+
+    local d = {gui = bb, holder = holder, conns = {}, peak = 0}
+
+    local function update()
+        if isDead(hum) then removeEsp(hum) return end
+        local mx = math.max(hum.MaxHealth, 1)
+        local h = math.clamp(hum.Health, 0, mx)
+        local pct = h / mx
+        hpFill.Size = UDim2.new(pct, 0, 1, 0)
+        hpLbl.Text = string.format("%d/%d  •  %d%%", math.floor(h + 0.5), math.floor(mx + 0.5), math.floor(pct * 100 + 0.5))
+    end
+
+    local function refreshStats()
+        -- Energia
+        local raw = readRaw(model, "energia")
+        if raw == nil then
+            enFill.Size = UDim2.new(0, 0, 1, 0)
+            enLbl.Text = "Energia: Fraca"
+        else
+            local cur = tonumber(raw)
+            if cur then
+                local mxRaw = tonumber(readRaw(model, "energiamax"))
+                d.peak = math.max(d.peak, cur)
+                local m = (mxRaw and mxRaw > 0) and mxRaw or d.peak
+                local pct = (m > 0) and math.clamp(cur / m, 0, 1) or 0
+                enFill.Size = UDim2.new(pct, 0, 1, 0)
+                if mxRaw and mxRaw > 0 then
+                    enLbl.Text = fmtVal(cur) .. "/" .. fmtVal(mxRaw)
+                else
+                    enLbl.Text = fmtVal(cur)
+                end
+            else
+                enFill.Size = UDim2.new(1, 0, 1, 0)
+                enLbl.Text = tostring(raw)
+            end
+        end
+        -- Grau
+        local g = readRaw(model, "grau")
+        grLbl.Text = "Grau: " .. (g ~= nil and fmtVal(g) or "Fraca")
+    end
+
+    espData[hum] = d
+    applySide(holder)
+    update()
+    if not espData[hum] then return end
+    refreshStats()
+
+    -- Remoção quando morrer (várias garantias)
+    table.insert(d.conns, hum.HealthChanged:Connect(update))
+    table.insert(d.conns, hum:GetPropertyChangedSignal("MaxHealth"):Connect(update))
+    table.insert(d.conns, hum.Died:Connect(function() removeEsp(hum) end))
+    table.insert(d.conns, hum.StateChanged:Connect(function(_, new)
+        if new == Enum.HumanoidStateType.Dead then removeEsp(hum) end
+    end))
+    table.insert(d.conns, hum.AncestryChanged:Connect(function()
+        if not hum:IsDescendantOf(workspace) then removeEsp(hum) end
+    end))
+    table.insert(d.conns, adornee.AncestryChanged:Connect(function()
+        if not adornee:IsDescendantOf(workspace) then removeEsp(hum) end
+    end))
+
+    -- Loop de atualização + checagem de morte
+    task.spawn(function()
+        while true do
+            task.wait(0.4)
+            if espData[hum] ~= d then break end
+            if isDead(hum) or not adornee:IsDescendantOf(workspace) then
+                removeEsp(hum)
+                break
+            end
+            refreshStats()
+        end
+    end)
+end
+
+local function setEsp(on)
+    espEnabled = on
+    for hum in pairs(espData) do removeEsp(hum) end
+    for _, c in ipairs(espConns) do c:Disconnect() end
+    espConns = {}
+    if on then
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("Humanoid") then addEsp(d) end
+        end
+        table.insert(espConns, workspace.DescendantAdded:Connect(function(d)
+            if d:IsA("Humanoid") then task.delay(0.3, addEsp, d) end
+        end))
+    end
+end
+
+espBtn.MouseButton1Click:Connect(function()
+    playClick() -- função
+    setEsp(not espEnabled)
+    refreshEspBtn()
+end)
+
 --// ABA: Configurações
 local pConfig = NewTab("⚙ Configurações")
 new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, pConfig)
@@ -247,10 +647,45 @@ vb.FocusLost:Connect(function()
     end
 end)
 
+-- ESP NPC: posição da barra
+new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, Text = "ESP NPC",
+    TextColor3 = Color3.fromRGB(170, 140, 145), Font = Enum.Font.GothamBold, TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = 4,
+}, pConfig)
+
+local sf = new("Frame", {Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = C.panel, LayoutOrder = 5}, pConfig)
+corner(sf, 6); stroke(sf, C.dark)
+new("TextLabel", {
+    Size = UDim2.new(1, -110, 1, 0), Position = UDim2.new(0, 10, 0, 0),
+    BackgroundTransparency = 1, Text = "Posição da barra", TextColor3 = C.text,
+    Font = Enum.Font.GothamMedium, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
+}, sf)
+local sideBtn = new("TextButton", {
+    Size = UDim2.new(0, 80, 0, 22), Position = UDim2.new(1, -88, 0.5, -11),
+    BackgroundColor3 = C.bg, Text = espSide, TextColor3 = C.text,
+    Font = Enum.Font.GothamMedium, TextSize = 13, AutoButtonColor = false,
+}, sf)
+corner(sideBtn, 5); stroke(sideBtn, C.red)
+sideBtn.MouseButton1Click:Connect(function()
+    if espSide == "Em cima" then
+        espSide = "Direita"
+    elseif espSide == "Direita" then
+        espSide = "Esquerda"
+    else
+        espSide = "Em cima"
+    end
+    sideBtn.Text = espSide
+    for _, d in pairs(espData) do applySide(d.holder) end
+    playClick() -- função
+end)
+
 selectTab("🏠 Início")
 
 --// Fechar (sem som)
 closeBtn.MouseButton1Click:Connect(function()
+    setEsp(false)
+    espFolder:Destroy()
     gui:Destroy()
 end)
 
